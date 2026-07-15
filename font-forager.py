@@ -14,7 +14,7 @@ table, weight from OS/2.usWeightClass — so the filename reflects the font's re
 weight rather than any remapped @font-face font-weight. Colliding names get a
 -2, -3 suffix.
 
-Afterwards two files are written into data/<host>/: an example.html specimen
+Afterwards two files are written into data/<host>/: a specimen.html specimen
 showing for each downloaded font the characters it actually contains (read from
 its cmap), and a style.css with a reusable @font-face rule per font — keyed on
 the font's real family name and weight — so the folder can be dropped into a
@@ -313,8 +313,8 @@ def write_specimen(out_dir, host):
 {''.join(sections)}
 </body>
 </html>"""
-    (out_dir / "example.html").write_text(page, encoding="utf-8")
-    print(f"→ Wrote {out_dir / 'example.html'} ({len(sections)} fonts)")
+    (out_dir / "specimen.html").write_text(page, encoding="utf-8")
+    print(f"→ Wrote {out_dir / 'specimen.html'} ({len(sections)} fonts)")
 
 
 # --------------------------------------------------------------------------- #

@@ -7,7 +7,7 @@ PIP    := $(VENV)/bin/pip
 help:
 	@echo "Targets:"
 	@echo "  make setup                 Create the venv and install dependencies"
-	@echo "  make run URL=<url>         Download the fonts a page loads + build example.html"
+	@echo "  make run URL=<url>         Download the fonts a page loads + build specimen.html"
 	@echo "  make clean                 Remove the venv"
 	@echo "  make clean-data            Remove the data/ output directory"
 
