@@ -67,3 +67,7 @@ stylesheets.
 
 Downloading fonts from a website does not grant you a license to use them. Check
 each font's license before reusing it in your own project.
+
+## License
+
+font-forager itself is released under the [MIT License](LICENSE).
