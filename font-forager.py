@@ -12,13 +12,16 @@ font into data/<host>/. Byte-identical files (the same font served under several
 own metadata as <family-slug>-<weight>[-italic].<ext> — family from the name
 table, weight from OS/2.usWeightClass — so the filename reflects the font's real
 weight rather than any remapped @font-face font-weight. Colliding names get a
--2, -3 suffix.
+-2, -3 suffix. Some foundries (e.g. Monotype's fast.fonts.net) strip the name
+table, leaving no family and no italic bit; for those the family, weight and
+italic flag are recovered from the @font-face-derived filename instead.
 
 Afterwards two files are written into data/<host>/: a specimen.html specimen
 showing for each downloaded font the characters it actually contains (read from
 its cmap), and a style.css with a reusable @font-face rule per font — keyed on
 the font's real family name and weight — so the folder can be dropped into a
-website as-is.
+website as-is. Legacy .eot files are downloaded but left out of both, since no
+current browser can use them.
 
 Note: this is a static fetch. Fonts injected at runtime by JavaScript are not
 discovered.
@@ -201,16 +204,14 @@ def canonical_name(path):
     remap weights — e.g. bird.com serves "TWK Lausanne 450" as font-weight:500).
     Returns None if the metadata is unreadable or incomplete.
     """
-    try:
-        font = TTFont(str(path), fontNumber=0, lazy=True)
-        family = _font_names(font)[0]
-        weight = font["OS/2"].usWeightClass
-    except Exception:
+    meta = _face_metadata(path)
+    if meta is None:
         return None
+    family, weight, is_italic, _ = meta
     slug = slugify(family)
-    if not slug or not weight:
+    if not slug:
         return None
-    italic = "-italic" if _is_italic(font) else ""
+    italic = "-italic" if is_italic else ""
     return f"{slug}-{weight}{italic}{path.suffix.lower()}"
 
 
@@ -287,7 +288,10 @@ SPECIMEN_CSS = """
 
 
 def write_specimen(out_dir, host):
-    fonts = sorted(p for p in out_dir.iterdir() if p.suffix.lower() in FONT_EXTS)
+    fonts = sorted(
+        p for p in out_dir.iterdir()
+        if p.suffix.lower() in FONT_EXTS and p.suffix.lower() != ".eot"
+    )
     sections = []
     for index, path in enumerate(fonts):
         section, err = _render_font(path, index)
@@ -322,21 +326,53 @@ def write_specimen(out_dir, host):
 # --------------------------------------------------------------------------- #
 
 
-def _face_metadata(path):
-    """Return (family, weight, italic, fmt) for a font, or None if unreadable.
+FILENAME_RE = re.compile(r"^(.*?)-(\d{2,4})(-italic)?(?:-\d+)?$")
 
-    Like canonical_name, this reads the truth from the font's own name table and
-    OS/2.usWeightClass rather than any @font-face declaration.
+
+def _family_from_filename(path):
+    """Reconstruct (family, weight, italic) from a canonical filename.
+
+    Some foundries (e.g. Monotype's fast.fonts.net) ship webfonts with the name
+    table stripped, so the font itself carries no family name. The filename is
+    the next best source: it was either derived from the site's @font-face
+    font-family or is the served basename.
+    """
+    m = FILENAME_RE.match(path.stem)
+    if m:
+        family, weight, italic = m.group(1), int(m.group(2)), bool(m.group(3))
+    else:
+        family, weight, italic = path.stem, 400, "italic" in path.stem.lower()
+    family = " ".join(w.capitalize() for w in family.split("-") if w)
+    return (family, weight, italic) if family else None
+
+
+def _face_metadata(path):
+    """Return (family, weight, italic, fmt) for a font, or None if unusable.
+
+    Like canonical_name, this prefers the truth from the font's own name table
+    and OS/2.usWeightClass over any @font-face declaration, falling back to the
+    filename for fonts whose metadata was stripped by the foundry.
     """
     try:
         font = TTFont(str(path), fontNumber=0, lazy=True)
-        family = _font_names(font)[0]
-        weight = font["OS/2"].usWeightClass
     except Exception:
         return None
+
+    family = _font_names(font)[0]
+    weight = font["OS/2"].usWeightClass if "OS/2" in font else 0
+    italic = _is_italic(font)
+
+    # A stripped font reports no family/weight and no italic bit, so the
+    # filename is the only remaining source for all three.
     if not family or not weight:
-        return None
-    return family, weight, _is_italic(font), FORMATS.get(path.suffix.lower(), "")
+        fallback = _family_from_filename(path)
+        if fallback is None:
+            return None
+        family = family or fallback[0]
+        weight = weight or fallback[1]
+        italic = italic or fallback[2]
+
+    return family, weight, italic, FORMATS.get(path.suffix.lower(), "")
 
 
 def write_stylesheet(out_dir, host, hash_ranges=None):
@@ -351,9 +387,11 @@ def write_stylesheet(out_dir, host, hash_ranges=None):
     hash_ranges = hash_ranges or {}
     faces = []
     for path in sorted(p for p in out_dir.iterdir() if p.suffix.lower() in FONT_EXTS):
+        if path.suffix.lower() == ".eot":
+            continue  # legacy IE format; no modern browser reads it
         meta = _face_metadata(path)
         if meta is None:
-            print(f"  (skipped in style.css) {path.name}: unreadable metadata", file=sys.stderr)
+            print(f"  (skipped in style.css) {path.name}: unreadable font", file=sys.stderr)
             continue
         urange = hash_ranges.get(hashlib.sha256(path.read_bytes()).hexdigest(), "")
         faces.append((path, *meta, urange))
