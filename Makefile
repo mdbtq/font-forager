@@ -29,9 +29,9 @@ env/clean: ## Remove the venv
 
 ##@ Run
 
-.PHONY: run
-run: $(PYTHON) ## Download the fonts a page loads + build specimen.html, e.g. make run URL=https://example.com
-	@test -n "$(URL)" || { echo "Usage: make run URL=https://example.com"; exit 1; }
+.PHONY: fonts/download
+fonts/download: $(PYTHON) ## Download the fonts a page loads + build specimen.html, e.g. make fonts/download URL=https://example.com
+	@test -n "$(URL)" || { echo "Usage: make fonts/download URL=https://example.com"; exit 1; }
 	$(PYTHON) font-forager.py "$(URL)"
 
 ##@ Data
@@ -42,7 +42,8 @@ data/clean: ## Remove the data/ output directory
 
 # Deprecated aliases, kept so existing habits and scripts keep working.
 # They carry no ## comment, so `make help` lists only the names above.
-.PHONY: setup clean clean-data
+.PHONY: setup clean clean-data run
 setup: env/setup
 clean: env/clean
 clean-data: data/clean
+run: fonts/download

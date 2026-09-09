@@ -36,7 +36,7 @@ This creates a `.venv` and installs the dependencies from `requirements.txt`.
 ## Usage
 
 ```sh
-make run URL=https://example.com
+make fonts/download URL=https://example.com
 ```
 
 Output is written to `data/<host>/`, containing the downloaded font files,
@@ -53,7 +53,7 @@ You can also run the script directly:
 | Target            | Description                                            |
 | ----------------- | ------------------------------------------------------ |
 | `make env/setup`  | Create the venv and install dependencies               |
-| `make run URL=…`  | Download the fonts a page loads + build `specimen.html` |
+| `make fonts/download URL=…`  | Download the fonts a page loads + build `specimen.html` |
 | `make env/clean`  | Remove the venv                                        |
 | `make data/clean` | Remove the `data/` output directory                    |
 
