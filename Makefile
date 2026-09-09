@@ -2,14 +2,16 @@ VENV   := .venv
 PYTHON := $(VENV)/bin/python
 PIP    := $(VENV)/bin/pip
 
-.PHONY: help setup run clean clean-data
+.DEFAULT_GOAL := help
 
-help:
-	@echo "Targets:"
-	@echo "  make setup                 Create the venv and install dependencies"
-	@echo "  make run URL=<url>         Download the fonts a page loads + build specimen.html"
-	@echo "  make clean                 Remove the venv"
-	@echo "  make clean-data            Remove the data/ output directory"
+.PHONY: help
+help: ## Show this help
+	@awk 'BEGIN {FS = ":.*?## "} \
+		/^##@ / {printf "  \033[1m%s\033[0m\n", substr($$0, 5); next} \
+		/^[a-zA-Z0-9_\/.-]+:.*?## / {printf "  \033[36m%-16s\033[0m %s\n", $$1, $$2}' \
+		$(MAKEFILE_LIST)
+
+##@ Environment
 
 # Create the venv and install deps; re-runs when requirements.txt changes.
 $(PYTHON): requirements.txt
@@ -18,14 +20,29 @@ $(PYTHON): requirements.txt
 	$(PIP) install -r requirements.txt
 	touch $(PYTHON)
 
-setup: $(PYTHON)
+.PHONY: env/setup
+env/setup: $(PYTHON) ## Create the venv and install dependencies
 
-run: $(PYTHON)
+.PHONY: env/clean
+env/clean: ## Remove the venv
+	rm -rf $(VENV)
+
+##@ Run
+
+.PHONY: run
+run: $(PYTHON) ## Download the fonts a page loads + build specimen.html, e.g. make run URL=https://example.com
 	@test -n "$(URL)" || { echo "Usage: make run URL=https://example.com"; exit 1; }
 	$(PYTHON) font-forager.py "$(URL)"
 
-clean:
-	rm -rf $(VENV)
+##@ Data
 
-clean-data:
+.PHONY: data/clean
+data/clean: ## Remove the data/ output directory
 	rm -rf data
+
+# Deprecated aliases, kept so existing habits and scripts keep working.
+# They carry no ## comment, so `make help` lists only the names above.
+.PHONY: setup clean clean-data
+setup: env/setup
+clean: env/clean
+clean-data: data/clean

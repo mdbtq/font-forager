@@ -22,13 +22,13 @@ font into `data/<host>/`. It then:
 ## Requirements
 
 - Python 3.8+
-- Dependencies (installed via `make setup`): [`fonttools`](https://github.com/fonttools/fonttools)
+- Dependencies (installed via `make env/setup`): [`fonttools`](https://github.com/fonttools/fonttools)
   and `brotli` (for reading `woff2`).
 
 ## Setup
 
 ```sh
-make setup
+make env/setup
 ```
 
 This creates a `.venv` and installs the dependencies from `requirements.txt`.
@@ -52,10 +52,10 @@ You can also run the script directly:
 
 | Target            | Description                                            |
 | ----------------- | ------------------------------------------------------ |
-| `make setup`      | Create the venv and install dependencies               |
+| `make env/setup`  | Create the venv and install dependencies               |
 | `make run URL=…`  | Download the fonts a page loads + build `specimen.html` |
-| `make clean`      | Remove the venv                                        |
-| `make clean-data` | Remove the `data/` output directory                    |
+| `make env/clean`  | Remove the venv                                        |
+| `make data/clean` | Remove the `data/` output directory                    |
 
 ## Limitations
 
