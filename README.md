@@ -3,21 +3,25 @@
 Download the fonts a web page loads, then generate a specimen and a drop-in
 stylesheet.
 
-font-forager fetches a page and its linked stylesheets, finds every font URL in
-`@font-face` rules and `<link rel="preload" as="font">` tags, and downloads each
-font into `data/<host>/`. It then:
+font-forager fetches a page and its linked stylesheets (following `@import`),
+finds every font URL in `@font-face` rules and `<link rel="preload" as="font">`
+tags, and downloads each font into `data/<host>/`. It then:
 
 - **Deduplicates** byte-identical files (the same font served under several
   `@font-face` family aliases).
 - **Renames** each file from its own metadata — `<family-slug>-<weight>[-italic].<ext>`,
   with family taken from the name table and weight from `OS/2.usWeightClass` — so
   the filename reflects the font's real weight rather than any remapped
-  `@font-face` `font-weight`.
+  `@font-face` `font-weight`. A variable font is named after the range of its
+  `wght` axis, for example `tasa-orbiter-400-800.woff2`.
 - Writes a **`specimen.html`** showing, per font, the characters it actually
-  contains (read from its cmap).
+  contains (read from its cmap), with a weight slider for variable fonts.
 - Writes a **`style.css`** with one reusable `@font-face` rule per font, keyed on
-  the font's real family and weight, using relative paths — so the folder can be
-  dropped into a website as-is.
+  the font's real family and weight (or weight range), using relative paths — so
+  the folder can be dropped into a website as-is.
+
+A variable font is one file that contains every weight in its range, so a weight
+such as 720 does not appear as a separate file.
 
 ## Requirements
 

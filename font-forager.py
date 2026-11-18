@@ -5,23 +5,26 @@ Usage: .venv/bin/python font-forager.py <url>
 
 Setup once:  python3 -m venv .venv && .venv/bin/pip install -r requirements.txt
 
-Fetches the page and its linked stylesheets, extracts every font URL it can find
-in @font-face rules and <link rel="preload" as="font"> tags, and downloads each
-font into data/<host>/. Byte-identical files (the same font served under several
-@font-face family aliases) are deduplicated, and each file is then named from its
-own metadata as <family-slug>-<weight>[-italic].<ext> — family from the name
-table, weight from OS/2.usWeightClass — so the filename reflects the font's real
-weight rather than any remapped @font-face font-weight. Colliding names get a
--2, -3 suffix. Some foundries (e.g. Monotype's fast.fonts.net) strip the name
-table, leaving no family and no italic bit; for those the family, weight and
-italic flag are recovered from the @font-face-derived filename instead.
+Fetches the page and its linked stylesheets (following @import), extracts every
+font URL it can find in @font-face rules and <link rel="preload" as="font"> tags,
+and downloads each font into data/<host>/. Byte-identical files (the same font
+served under several @font-face family aliases) are deduplicated, and each file
+is then named from its own metadata as <family-slug>-<weight>[-italic].<ext> —
+family from the name table, weight from OS/2.usWeightClass — so the filename
+reflects the font's real weight rather than any remapped @font-face font-weight.
+A variable font covers a range of weights, read from its wght axis, and is named
+<family-slug>-<low>-<high>[-italic].<ext>. Colliding names get a -2, -3 suffix.
+Some foundries (e.g. Monotype's fast.fonts.net) strip the name table, leaving no
+family and no italic bit; for those the family, weight and italic flag are
+recovered from the @font-face-derived filename instead.
 
 Afterwards two files are written into data/<host>/: a specimen.html specimen
 showing for each downloaded font the characters it actually contains (read from
-its cmap), and a style.css with a reusable @font-face rule per font — keyed on
-the font's real family name and weight — so the folder can be dropped into a
-website as-is. Legacy .eot files are downloaded but left out of both, since no
-current browser can use them.
+its cmap), with a weight slider for variable fonts, and a style.css with a
+reusable @font-face rule per font — keyed on the font's real family name and
+weight or weight range — so the folder can be dropped into a website as-is.
+Legacy .eot files are downloaded but left out of both, since no current browser
+can use them.
 
 Note: this is a static fetch. Fonts injected at runtime by JavaScript are not
 discovered.
@@ -135,6 +138,7 @@ def is_font_url(url):
 
 FONT_FACE_RE = re.compile(r"@font-face\s*{([^}]*)}", re.IGNORECASE)
 URL_RE = re.compile(r"url\(\s*([^)]+?)\s*\)", re.IGNORECASE)
+IMPORT_RE = re.compile(r"""@import\s*(?:url\(\s*["']?|["'])([^"')\s]+)""", re.IGNORECASE)
 
 
 def _decl(block, prop):
@@ -175,6 +179,11 @@ def fallback_fonts(base, text):
         yield url, base_of(url)
 
 
+def imported_stylesheets(base, text):
+    """Return the resolved url of every @import in a source."""
+    return [urljoin(base, ref) for ref in IMPORT_RE.findall(text)]
+
+
 # --------------------------------------------------------------------------- #
 # Canonical naming from font metadata
 # --------------------------------------------------------------------------- #
@@ -184,6 +193,25 @@ def _font_names(font):
     family = name.getDebugName(16) or name.getDebugName(1) or ""
     subfamily = name.getDebugName(17) or name.getDebugName(2) or ""
     return family.strip(), subfamily.strip()
+
+
+def _weight_range(font):
+    """Return the (low, high) weights a font covers; equal for a static font.
+
+    For a variable font OS/2.usWeightClass only describes the default instance,
+    so the wght axis is the source of truth.
+    """
+    if "fvar" in font:
+        for axis in font["fvar"].axes:
+            if axis.axisTag == "wght":
+                return round(axis.minValue), round(axis.maxValue)
+    weight = font["OS/2"].usWeightClass if "OS/2" in font else 0
+    return weight, weight
+
+
+def _format_weight(weight, separator):
+    low, high = weight
+    return str(low) if low == high else f"{low}{separator}{high}"
 
 
 def _is_italic(font):
@@ -200,8 +228,9 @@ def canonical_name(path):
     """Name a font from its own metadata: <family-slug>-<weight>[-italic].<ext>.
 
     The truth about a font's family and weight lives in its name table and
-    OS/2.usWeightClass, not in the site's @font-face declaration (which may
-    remap weights — e.g. bird.com serves "TWK Lausanne 450" as font-weight:500).
+    OS/2.usWeightClass (or wght axis, giving <low>-<high> for a variable font),
+    not in the site's @font-face declaration (which may remap weights — e.g.
+    bird.com serves "TWK Lausanne 450" as font-weight:500).
     Returns None if the metadata is unreadable or incomplete.
     """
     meta = _face_metadata(path)
@@ -212,7 +241,7 @@ def canonical_name(path):
     if not slug:
         return None
     italic = "-italic" if is_italic else ""
-    return f"{slug}-{weight}{italic}{path.suffix.lower()}"
+    return f"{slug}-{_format_weight(weight, '-')}{italic}{path.suffix.lower()}"
 
 
 # --------------------------------------------------------------------------- #
@@ -233,6 +262,7 @@ def _render_font(path, index):
     try:
         font = TTFont(str(path), fontNumber=0, lazy=True)
         cmap = font.getBestCmap()
+        low, high = _weight_range(font)
     except Exception as exc:  # unreadable / no unicode cmap
         return None, f"{path.name}: {exc}"
 
@@ -248,13 +278,24 @@ def _render_font(path, index):
         f'<span class="cp">{cp:04X}</span></div>'
         for cp in visible
     )
-    css = f"@font-face{{font-family:'{face_id}';src:{src};font-display:swap;}}"
+    weight_css = weight_meta = slider = ""
+    if low != high:
+        start = min(max(400, low), high)
+        weight_css = f"font-weight:{low} {high};"
+        weight_meta = f" &middot; variable weight {low}&ndash;{high}"
+        slider = (
+            f'\n    <label class="weight">Weight <input type="range" min="{low}" '
+            f'max="{high}" value="{start}" oninput="'
+            "this.closest('section').querySelector('.grid').style.fontWeight=this.value;"
+            f'this.nextElementSibling.value=this.value"><output>{start}</output></label>'
+        )
+    css = f"@font-face{{font-family:'{face_id}';src:{src};{weight_css}font-display:swap;}}"
     return (
         f"""<section>
   <style>{css}</style>
   <header>
     <h2 style="font-family:'{face_id}',system-ui,sans-serif">{escape(label)}</h2>
-    <p class="meta">{escape(path.name)} &middot; {len(cmap)} characters ({len(visible)} shown)</p>
+    <p class="meta">{escape(path.name)} &middot; {len(cmap)} characters ({len(visible)} shown){weight_meta}</p>{slider}
   </header>
   <div class="grid" style="font-family:'{face_id}',system-ui,sans-serif">{cells}</div>
 </section>""",
@@ -276,6 +317,8 @@ SPECIMEN_CSS = """
   header h2 { font-size:1.6rem; margin:0 0 .25rem; font-weight:500; }
   .meta { color:var(--muted); font-size:.85rem; margin:0 0 1rem;
     font-family:ui-monospace,monospace; }
+  .weight { display:flex; align-items:center; gap:.5rem; margin:0 0 1rem;
+    color:var(--muted); font-size:.85rem; }
   .grid { display:grid; gap:4px;
     grid-template-columns:repeat(auto-fill,minmax(56px,1fr)); }
   .cell { display:flex; flex-direction:column; align-items:center;
@@ -347,10 +390,10 @@ def _family_from_filename(path):
 
 
 def _face_metadata(path):
-    """Return (family, weight, italic, fmt) for a font, or None if unusable.
+    """Return (family, (low, high), italic, fmt) for a font, or None if unusable.
 
     Like canonical_name, this prefers the truth from the font's own name table
-    and OS/2.usWeightClass over any @font-face declaration, falling back to the
+    and weight metadata over any @font-face declaration, falling back to the
     filename for fonts whose metadata was stripped by the foundry.
     """
     try:
@@ -359,17 +402,17 @@ def _face_metadata(path):
         return None
 
     family = _font_names(font)[0]
-    weight = font["OS/2"].usWeightClass if "OS/2" in font else 0
+    weight = _weight_range(font)
     italic = _is_italic(font)
 
     # A stripped font reports no family/weight and no italic bit, so the
     # filename is the only remaining source for all three.
-    if not family or not weight:
+    if not family or not weight[0]:
         fallback = _family_from_filename(path)
         if fallback is None:
             return None
         family = family or fallback[0]
-        weight = weight or fallback[1]
+        weight = weight if weight[0] else (fallback[1], fallback[1])
         italic = italic or fallback[2]
 
     return family, weight, italic, FORMATS.get(path.suffix.lower(), "")
@@ -378,8 +421,9 @@ def _face_metadata(path):
 def write_stylesheet(out_dir, host, hash_ranges=None):
     """Write style.css with one reusable @font-face rule per downloaded font.
 
-    Each rule uses the font's real family name and weight, so a site can select
-    a family by name and let the browser pick the matching weight/style. Paths
+    Each rule uses the font's real family name and weight (a range for a variable
+    font), so a site can select a family by name and let the browser pick the
+    matching weight/style. Paths
     are relative, so style.css works wherever the font files sit beside it.
     When a font was served as a unicode-range subset, that range is emitted so
     the split is preserved (looked up in hash_ranges by the file's content).
@@ -411,7 +455,7 @@ def write_stylesheet(out_dir, host, hash_ranges=None):
             "@font-face {\n"
             f'  font-family: "{css_family}";\n'
             f"  font-style: {'italic' if italic else 'normal'};\n"
-            f"  font-weight: {weight};\n"
+            f"  font-weight: {_format_weight(weight, ' ')};\n"
             "  font-display: swap;\n"
             f"  src: {src};\n"
             f"{range_line}"
@@ -439,15 +483,25 @@ def collect_font_map(page_url):
     links = LinkCollector()
     links.feed(page_html)
 
-    # Sources to scan for @font-face: the page first, then linked stylesheets.
+    # Sources to scan for @font-face: the page first, then linked stylesheets
+    # and everything they @import.
     sources = [(page_url, page_html)]
-    for ref in links.stylesheets:
-        css_url = urljoin(page_url, ref)
+    pending = [urljoin(page_url, ref) for ref in links.stylesheets]
+    pending += imported_stylesheets(page_url, page_html)
+    seen = set()
+    while pending:
+        css_url = pending.pop(0)
+        if css_url in seen:
+            continue
+        seen.add(css_url)
         print(f"  · stylesheet: {css_url}")
         try:
-            sources.append((css_url, fetch_text(css_url)))
+            css = fetch_text(css_url)
         except Exception as exc:
             print(f"    (failed) {exc}", file=sys.stderr)
+            continue
+        sources.append((css_url, css))
+        pending += imported_stylesheets(css_url, css)
 
     mapping = {}  # url -> name; first (named) mapping wins
     ranges = {}   # url -> unicode-range; first declaration wins
