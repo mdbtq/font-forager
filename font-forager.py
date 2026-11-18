@@ -8,8 +8,9 @@ Setup once:  python3 -m venv .venv && .venv/bin/pip install -r requirements.txt
 Fetches the page and its linked stylesheets (following @import), extracts every
 font URL it can find in @font-face rules and <link rel="preload" as="font"> tags,
 and downloads each font into data/<host>/. Byte-identical files (the same font
-served under several @font-face family aliases) are deduplicated, and each file
-is then named from its own metadata as <family-slug>-<weight>[-italic].<ext> —
+served under several @font-face family aliases) are deduplicated, unicode-range
+subsets of one face are merged into a single file, and each file is then named
+from its own metadata as <family-slug>-<weight>[-italic].<ext> —
 family from the name table, weight from OS/2.usWeightClass — so the filename
 reflects the font's real weight rather than any remapped @font-face font-weight.
 A variable font covers a range of weights, read from its wght axis, and is named
@@ -31,16 +32,23 @@ discovered.
 """
 
 import hashlib
+import heapq
 import re
 import sys
+import tempfile
 import unicodedata
 import urllib.request
 from html import escape
 from html.parser import HTMLParser
 from pathlib import Path
+from unittest import mock
 from urllib.parse import urljoin, urlsplit
 
-from fontTools.ttLib import TTFont
+from fontTools.merge import Merger
+from fontTools.pens.recordingPen import DecomposingRecordingPen
+from fontTools.ttLib import TTFont, newTable
+from fontTools.varLib.hvar import add_HVAR
+from fontTools.varLib.varStore import NO_VARIATION_INDEX
 
 UA = (
     "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 "
@@ -151,7 +159,7 @@ def named_fonts(base, text):
 
     unicode_range is "" when the rule declares none. It is carried through so a
     subsetted family (many files, same family/weight/style, each covering a
-    different range) can be reassembled faithfully in the generated style.css.
+    different range) can be recognised and merged into one file.
     """
     for block in FONT_FACE_RE.findall(text):
         slug = slugify(_decl(block, "font-family"))
@@ -425,8 +433,8 @@ def write_stylesheet(out_dir, host, hash_ranges=None):
     font), so a site can select a family by name and let the browser pick the
     matching weight/style. Paths
     are relative, so style.css works wherever the font files sit beside it.
-    When a font was served as a unicode-range subset, that range is emitted so
-    the split is preserved (looked up in hash_ranges by the file's content).
+    A subset that was not merged keeps its unicode-range (looked up in
+    hash_ranges by the file's content); a merged file needs none.
     """
     hash_ranges = hash_ranges or {}
     faces = []
@@ -475,7 +483,7 @@ def collect_font_map(page_url):
     """Return ({url: filename}, {url: unicode_range}) for the fonts to download.
 
     The second dict holds only urls whose @font-face rule declared a
-    unicode-range; it is used to preserve subset splits in the style.css.
+    unicode-range; it identifies the subsets to merge.
     """
     print(f"→ Fetching page: {page_url}")
     page_html = fetch_text(page_url)
@@ -548,6 +556,232 @@ def dedupe_identical(out_dir):
                 path.unlink()
                 print(f"  · deduped {path.name} (identical to {keep.name})")
                 removed += 1
+    return removed
+
+
+def _combine_var_stores(fonts):
+    """Move each font's GDEF VarStore into one and return it.
+
+    Mark positions in GPOS vary by weight through indices into this store, so
+    the indices are shifted to where each font's data ends up.
+    """
+    combined = None
+    for font in fonts:
+        gdef = font["GDEF"].table if "GDEF" in font else None
+        store = getattr(gdef, "VarStore", None)
+        if store is None:
+            continue
+        gdef.VarStore = None
+        if combined is None:
+            combined = store
+            continue
+
+        outer_offset = len(combined.VarData)
+        region_offset = len(combined.VarRegionList.Region)
+        combined.VarRegionList.Region.extend(store.VarRegionList.Region)
+        combined.VarRegionList.RegionCount = len(combined.VarRegionList.Region)
+        for data in store.VarData:
+            data.VarRegionIndex = [region_offset + i for i in data.VarRegionIndex]
+            combined.VarData.append(data)
+        combined.VarDataCount = len(combined.VarData)
+
+        tables = [gdef] + ([font["GPOS"].table] if "GPOS" in font else [])
+        indices = set()
+        for table in tables:
+            table.collect_device_varidxes(indices)
+        mapping = {
+            index: index if index == NO_VARIATION_INDEX else index + (outer_offset << 16)
+            for index in indices
+        }
+        for table in tables:
+            table.remap_device_varidxes(mapping)
+    return combined
+
+
+def _shared_glyph_keys(font):
+    """Return {glyph id: [key, ...]} identifying each encoded glyph across subsets.
+
+    A key combines the code point with the glyph's outline and advance, at the
+    default location and at both ends of every variation axis. Only TrueType
+    outlines are shared; other subsets keep Merger's separate glyph copies.
+    """
+    if "glyf" not in font:
+        return {}
+    locations = [{}]
+    if "fvar" in font:
+        for axis in font["fvar"].axes:
+            locations += [{axis.axisTag: axis.minValue}, {axis.axisTag: axis.maxValue}]
+    glyph_sets = [font.getGlyphSet(location=location) for location in locations]
+
+    fingerprints, keys = {}, {0: [".notdef"]}
+    for codepoint, name in font.getBestCmap().items():
+        if name not in fingerprints:
+            shapes = []
+            for glyph_set in glyph_sets:
+                pen = DecomposingRecordingPen(glyph_set)
+                glyph_set[name].draw(pen)
+                shapes.append((repr(pen.value), glyph_set[name].width))
+            fingerprints[name] = tuple(shapes)
+        keys.setdefault(font.getGlyphID(name), []).append((codepoint, fingerprints[name]))
+    return keys
+
+
+def _combined_glyph_order(orders):
+    """Return one glyph order that preserves the relative order of every input.
+
+    Layout coverage tables list glyphs by ascending glyph id, and browsers reject
+    fonts where they do not, so no subset's glyphs may change relative position.
+    """
+    rank, successors, blockers = {}, {}, {}
+    for order in orders:
+        for name in order:
+            rank.setdefault(name, len(rank))
+            successors.setdefault(name, set())
+            blockers.setdefault(name, 0)
+        for before, after in zip(order, order[1:]):
+            if before != after and after not in successors[before]:
+                successors[before].add(after)
+                blockers[after] += 1
+
+    ready = [(rank[name], name) for name in rank if not blockers[name]]
+    heapq.heapify(ready)
+    combined = []
+    while ready:
+        _, name = heapq.heappop(ready)
+        combined.append(name)
+        for successor in successors[name]:
+            blockers[successor] -= 1
+            if not blockers[successor]:
+                heapq.heappush(ready, (rank[successor], successor))
+    if len(combined) != len(rank):
+        raise ValueError("subsets order their shared glyphs differently")
+    return combined
+
+
+def _shared_glyph_order(glyph_keys):
+    """Build a replacement for Merger's glyph naming step.
+
+    Merger keeps a separate copy of every glyph that occurs in several subsets.
+    Each subset's mark positioning then only reaches its own copy, and only one
+    copy is encoded, so accents can lose their position. Giving identical glyphs
+    one name makes all subsets' layout rules apply to the same glyph.
+    """
+    def order_glyphs(merger, glyph_orders):
+        shared, used_names = {}, set()
+        for order, keys in zip(glyph_orders, glyph_keys):
+            for glyph_id, name in enumerate(order):
+                glyph_keys_here = keys.get(glyph_id, [])
+                unique = next((shared[k] for k in glyph_keys_here if k in shared), None)
+                if unique is None:
+                    unique, suffix = name, 1
+                    while unique in used_names:
+                        unique, suffix = f"{name}.{suffix}", suffix + 1
+                    used_names.add(unique)
+                shared.update((key, unique) for key in glyph_keys_here)
+                order[glyph_id] = unique
+        merger.glyphOrder = _combined_glyph_order(glyph_orders)
+        renamed_orders.extend(glyph_orders)
+
+    renamed_orders = []
+    return order_glyphs, renamed_orders
+
+
+def merge_font_files(paths):
+    """Merge subset files of one font into a single TTFont.
+
+    fontTools' Merger cannot handle variation data, so for variable fonts that
+    data is set aside, the static parts are merged, and it is then restored
+    under the merged glyph names.
+    """
+    fonts = [TTFont(str(path)) for path in paths]
+    flavor = fonts[0].flavor
+    variable = "fvar" in fonts[0]
+    shared_tables, glyph_variations, var_store = {}, [], None
+    order_glyphs, glyph_orders = _shared_glyph_order([_shared_glyph_keys(f) for f in fonts])
+
+    if variable:
+        axes = [
+            [(a.axisTag, a.minValue, a.defaultValue, a.maxValue) for a in font["fvar"].axes]
+            if "fvar" in font else None
+            for font in fonts
+        ]
+        if any(a != axes[0] for a in axes):
+            raise ValueError("subsets have different variation axes")
+        shared_tables = {t: fonts[0][t] for t in ("fvar", "avar", "MVAR", "STAT") if t in fonts[0]}
+        glyph_variations = [
+            [font["gvar"].variations[g] for g in font.getGlyphOrder()] for font in fonts
+        ]
+        var_store = _combine_var_stores(fonts)
+        for font in fonts:
+            for tag in ("fvar", "avar", "gvar", "HVAR", "MVAR", "STAT"):
+                if tag in font:
+                    del font[tag]
+
+    with tempfile.TemporaryDirectory() as tmp:
+        files = []
+        for index, font in enumerate(fonts):
+            font.flavor = None
+            files.append(f"{tmp}/{index}")
+            font.save(files[-1])
+        with mock.patch("fontTools.merge.computeMegaGlyphOrder", order_glyphs):
+            merged = Merger().merge(files)
+        merged.flavor = flavor
+        merged.recalcTimestamp = False
+        if "glyf" in merged:  # Merger sums these, counting shared glyphs repeatedly
+            merged["glyf"].glyphOrder = merged.getGlyphOrder()
+            merged["maxp"].numGlyphs = len(merged.getGlyphOrder())
+
+        if variable:
+            gvar = newTable("gvar")
+            gvar.version, gvar.reserved = 1, 0
+            gvar.variations = {
+                name: variations
+                for order, font_variations in zip(glyph_orders, glyph_variations)
+                for name, variations in zip(order, font_variations)
+            }
+            merged["gvar"] = gvar
+            for tag, table in shared_tables.items():
+                merged[tag] = table
+            if var_store is not None:
+                merged["GDEF"].table.VarStore = var_store
+                merged["GDEF"].table.Version = max(merged["GDEF"].table.Version, 0x00010003)
+            add_HVAR(merged)
+    return merged
+
+
+def merge_subsets(out_dir, hash_ranges):
+    """Merge unicode-range subsets of the same face into one file.
+
+    Only files served with a unicode-range are candidates, so the same font in
+    another format or an unrelated file with matching metadata stays separate.
+    A group that cannot be merged keeps its subset files. Returns the number of
+    files removed.
+    """
+    groups = {}
+    for path in sorted(out_dir.iterdir()):
+        suffix = path.suffix.lower()
+        if suffix not in FORMATS:
+            continue
+        if hashlib.sha256(path.read_bytes()).hexdigest() not in hash_ranges:
+            continue
+        meta = _face_metadata(path)
+        if meta is not None:
+            family, weight, italic, _ = meta
+            groups.setdefault((family, weight, italic, suffix), []).append(path)
+
+    removed = 0
+    for (family, *_), paths in groups.items():
+        if len(paths) < 2:
+            continue
+        try:
+            merge_font_files(paths).save(str(paths[0]))
+        except Exception as exc:
+            print(f"  (kept {len(paths)} subsets of {family} separate) {exc}", file=sys.stderr)
+            continue
+        for path in paths[1:]:
+            path.unlink()
+        print(f"  · merged {len(paths)} subsets of {family} into {paths[0].name}")
+        removed += len(paths) - 1
     return removed
 
 
@@ -627,6 +861,10 @@ def main():
     removed = dedupe_identical(out_dir)
     if removed:
         print(f"→ Removed {removed} duplicate file(s)")
+
+    merged = merge_subsets(out_dir, hash_ranges)
+    if merged:
+        print(f"→ Merged subsets, removing {merged} file(s)")
 
     renamed = rename_to_canonical(out_dir)
     if renamed:

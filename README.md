@@ -9,6 +9,9 @@ tags, and downloads each font into `data/<host>/`. It then:
 
 - **Deduplicates** byte-identical files (the same font served under several
   `@font-face` family aliases).
+- **Merges** `unicode-range` subsets of the same family, weight, style and format
+  into one file, including variable fonts. Subsets that cannot be merged safely
+  stay separate and keep their `unicode-range`.
 - **Renames** each file from its own metadata — `<family-slug>-<weight>[-italic].<ext>`,
   with family taken from the name table and weight from `OS/2.usWeightClass` — so
   the filename reflects the font's real weight rather than any remapped
