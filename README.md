@@ -16,15 +16,19 @@ tags, and downloads each font into `data/<host>/`. It then:
   with family taken from the name table and weight from `OS/2.usWeightClass` — so
   the filename reflects the font's real weight rather than any remapped
   `@font-face` `font-weight`. A variable font is named after the range of its
-  `wght` axis, for example `tasa-orbiter-400-800.woff2`.
-- Writes a **`specimen.html`** showing, per font, the characters it actually
+  `wght` axis, for example `tasa-orbiter-400-800.woff2`. If a webfont kit blanked
+  the family name, family, weight and italic come from the full name (for example
+  `Alliance No.1 Bold Italic`) when it ends in a known style.
+- Writes a **`specimen.html`** showing, per face, the characters it actually
   contains (read from its cmap), with a weight slider for variable fonts.
-- Writes a **`style.css`** with one reusable `@font-face` rule per font, keyed on
+- Writes a **`style.css`** with one reusable `@font-face` rule per face, keyed on
   the font's real family and weight (or weight range), using relative paths — so
   the folder can be dropped into a website as-is.
 
 A variable font is one file that contains every weight in its range, so a weight
-such as 720 does not appear as a separate file.
+such as 720 does not appear as a separate file. Files holding the same face in
+different formats stay on disk, and share one specimen section and one
+`@font-face` rule that lists woff2 first.
 
 ## Requirements
 

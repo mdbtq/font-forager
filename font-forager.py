@@ -16,14 +16,17 @@ reflects the font's real weight rather than any remapped @font-face font-weight.
 A variable font covers a range of weights, read from its wght axis, and is named
 <family-slug>-<low>-<high>[-italic].<ext>. Colliding names get a -2, -3 suffix.
 Some foundries (e.g. Monotype's fast.fonts.net) strip the name table, leaving no
-family and no italic bit; for those the family, weight and italic flag are
-recovered from the @font-face-derived filename instead.
+family and no italic bit. Webfont kits may also reset the weight and italic bits
+while keeping a full name such as "Alliance No.1 Bold Italic"; family and style
+are then read from that name. Otherwise the family, weight and italic flag are
+recovered from the @font-face-derived filename.
 
 Afterwards two files are written into data/<host>/: a specimen.html specimen
-showing for each downloaded font the characters it actually contains (read from
+showing for each downloaded face the characters it actually contains (read from
 its cmap), with a weight slider for variable fonts, and a style.css with a
-reusable @font-face rule per font — keyed on the font's real family name and
-weight or weight range — so the folder can be dropped into a website as-is.
+reusable @font-face rule per face — keyed on the font's real family name and
+weight or weight range — so the folder can be dropped into a website as-is. One
+face served in several formats (e.g. woff2 and woff) shares a section and a rule.
 Legacy .eot files are downloaded but left out of both, since no current browser
 can use them.
 
@@ -196,7 +199,36 @@ def imported_stylesheets(base, text):
 # Canonical naming from font metadata
 # --------------------------------------------------------------------------- #
 
+WEIGHT_NAMES = {
+    "thin": 100, "extralight": 200, "ultralight": 200, "light": 300,
+    "regular": 400, "book": 400, "medium": 500, "semibold": 600, "demibold": 600,
+    "bold": 700, "extrabold": 800, "ultrabold": 800, "heavy": 800, "black": 900,
+}
+FULL_NAME_RE = re.compile(
+    r"^(.*?\S)\s+((?:(?:(?:extra|ultra|semi|demi)[\s-]?)?"
+    r"(?:thin|light|regular|book|medium|bold|heavy|black)(?:\s+italic)?)|italic)$",
+    re.IGNORECASE,
+)
+
+
+def _full_name_parts(font):
+    """Return (family, style) from the full name of a font without a family name.
+
+    Webfont kits can blank the family name and reset the weight and italic bits
+    while the full name still reads "Alliance No.1 Bold Italic". Returns None if
+    the font has a family name or its full name ends in no known style.
+    """
+    name = font["name"]
+    if (name.getDebugName(16) or name.getDebugName(1) or "").strip():
+        return None
+    match = FULL_NAME_RE.match((name.getDebugName(4) or "").strip())
+    return match.groups() if match else None
+
+
 def _font_names(font):
+    parts = _full_name_parts(font)
+    if parts:
+        return parts
     name = font["name"]
     family = name.getDebugName(16) or name.getDebugName(1) or ""
     subfamily = name.getDebugName(17) or name.getDebugName(2) or ""
@@ -207,12 +239,18 @@ def _weight_range(font):
     """Return the (low, high) weights a font covers; equal for a static font.
 
     For a variable font OS/2.usWeightClass only describes the default instance,
-    so the wght axis is the source of truth.
+    so the wght axis is the source of truth. A weight named in the full name of a
+    font without a family name beats usWeightClass, which is then unreliable.
     """
     if "fvar" in font:
         for axis in font["fvar"].axes:
             if axis.axisTag == "wght":
                 return round(axis.minValue), round(axis.maxValue)
+    parts = _full_name_parts(font)
+    if parts:
+        named = WEIGHT_NAMES.get(re.sub(r"italic|[\s-]", "", parts[1].lower()))
+        if named:
+            return named, named
     weight = font["OS/2"].usWeightClass if "OS/2" in font else 0
     return weight, weight
 
@@ -244,7 +282,7 @@ def canonical_name(path):
     meta = _face_metadata(path)
     if meta is None:
         return None
-    family, weight, is_italic, _ = meta
+    family, weight, is_italic = meta
     slug = slugify(family)
     if not slug:
         return None
@@ -265,8 +303,17 @@ def _visible_codepoints(cmap):
     return out
 
 
-def _render_font(path, index):
-    """Return an HTML section for one font, or (None, error)."""
+def _font_src(paths, quote=str):
+    """Return an @font-face src value listing each file with its format."""
+    return ", ".join(
+        f'url("{quote(path.name)}") format("{FORMATS[path.suffix.lower()]}")'
+        for path in paths
+    )
+
+
+def _render_font(paths, index):
+    """Return an HTML section for one face, or (None, error)."""
+    path = paths[0]
     try:
         font = TTFont(str(path), fontNumber=0, lazy=True)
         cmap = font.getBestCmap()
@@ -278,8 +325,8 @@ def _render_font(path, index):
     label = " ".join(p for p in (family, subfamily) if p) or path.stem
     visible = _visible_codepoints(cmap)
     face_id = f"ff-{index}"
-    fmt = FORMATS.get(path.suffix.lower(), "")
-    src = f'url("{escape(path.name)}")' + (f' format("{fmt}")' if fmt else "")
+    src = _font_src(paths, escape)
+    file_names = ", ".join(escape(p.name) for p in paths)
 
     cells = "".join(
         f'<div class="cell"><span class="glyph">{escape(chr(cp))}</span>'
@@ -303,7 +350,7 @@ def _render_font(path, index):
   <style>{css}</style>
   <header>
     <h2 style="font-family:'{face_id}',system-ui,sans-serif">{escape(label)}</h2>
-    <p class="meta">{escape(path.name)} &middot; {len(cmap)} characters ({len(visible)} shown){weight_meta}</p>{slider}
+    <p class="meta">{file_names} &middot; {len(cmap)} characters ({len(visible)} shown){weight_meta}</p>{slider}
   </header>
   <div class="grid" style="font-family:'{face_id}',system-ui,sans-serif">{cells}</div>
 </section>""",
@@ -338,14 +385,10 @@ SPECIMEN_CSS = """
 """
 
 
-def write_specimen(out_dir, host):
-    fonts = sorted(
-        p for p in out_dir.iterdir()
-        if p.suffix.lower() in FONT_EXTS and p.suffix.lower() != ".eot"
-    )
+def write_specimen(out_dir, host, faces):
     sections = []
-    for index, path in enumerate(fonts):
-        section, err = _render_font(path, index)
+    for index, paths in enumerate(faces):
+        section, err = _render_font(paths, index)
         if section:
             sections.append(section)
         elif err:
@@ -398,7 +441,7 @@ def _family_from_filename(path):
 
 
 def _face_metadata(path):
-    """Return (family, (low, high), italic, fmt) for a font, or None if unusable.
+    """Return (family, (low, high), italic) for a font, or None if unusable.
 
     Like canonical_name, this prefers the truth from the font's own name table
     and weight metadata over any @font-face declaration, falling back to the
@@ -423,41 +466,38 @@ def _face_metadata(path):
         weight = weight if weight[0] else (fallback[1], fallback[1])
         italic = italic or fallback[2]
 
-    return family, weight, italic, FORMATS.get(path.suffix.lower(), "")
+    return family, weight, italic
 
 
-def write_stylesheet(out_dir, host, hash_ranges=None):
-    """Write style.css with one reusable @font-face rule per downloaded font.
+def write_stylesheet(out_dir, host, faces, hash_ranges=None):
+    """Write style.css with one reusable @font-face rule per face.
 
     Each rule uses the font's real family name and weight (a range for a variable
     font), so a site can select a family by name and let the browser pick the
-    matching weight/style. Paths
+    matching weight/style. Its src lists every format of the face. Paths
     are relative, so style.css works wherever the font files sit beside it.
     A subset that was not merged keeps its unicode-range (looked up in
     hash_ranges by the file's content); a merged file needs none.
     """
     hash_ranges = hash_ranges or {}
-    faces = []
-    for path in sorted(p for p in out_dir.iterdir() if p.suffix.lower() in FONT_EXTS):
-        if path.suffix.lower() == ".eot":
-            continue  # legacy IE format; no modern browser reads it
-        meta = _face_metadata(path)
+    described = []
+    for paths in faces:
+        meta = _face_metadata(paths[0])
         if meta is None:
-            print(f"  (skipped in style.css) {path.name}: unreadable font", file=sys.stderr)
+            print(f"  (skipped in style.css) {paths[0].name}: unreadable font", file=sys.stderr)
             continue
-        urange = hash_ranges.get(hashlib.sha256(path.read_bytes()).hexdigest(), "")
-        faces.append((path, *meta, urange))
+        urange = hash_ranges.get(hashlib.sha256(paths[0].read_bytes()).hexdigest(), "")
+        described.append((paths, *meta, urange))
 
-    if not faces:
+    if not described:
         return
 
     # Group by family, then weight, upright before italic.
-    faces.sort(key=lambda f: (f[1].lower(), f[2], f[3]))
+    described.sort(key=lambda f: (f[1].lower(), f[2], f[3]))
 
     rules = []
-    for path, family, weight, italic, fmt, urange in faces:
+    for paths, family, weight, italic, urange in described:
         css_family = family.replace("\\", "\\\\").replace('"', '\\"')
-        src = f'url("{path.name}")' + (f' format("{fmt}")' if fmt else "")
         range_line = f"  unicode-range: {urange};\n" if urange else ""
         rules.append(
             "@font-face {\n"
@@ -465,7 +505,7 @@ def write_stylesheet(out_dir, host, hash_ranges=None):
             f"  font-style: {'italic' if italic else 'normal'};\n"
             f"  font-weight: {_format_weight(weight, ' ')};\n"
             "  font-display: swap;\n"
-            f"  src: {src};\n"
+            f"  src: {_font_src(paths)};\n"
             f"{range_line}"
             "}"
         )
@@ -766,7 +806,7 @@ def merge_subsets(out_dir, hash_ranges):
             continue
         meta = _face_metadata(path)
         if meta is not None:
-            family, weight, italic, _ = meta
+            family, weight, italic = meta
             groups.setdefault((family, weight, italic, suffix), []).append(path)
 
     removed = 0
@@ -813,6 +853,35 @@ def rename_to_canonical(out_dir):
         (out_dir / f".rename-{i}.tmp").rename(out_dir / name)
         print(f"  · renamed {path.name} → {name}")
     return len(pending)
+
+
+def group_face_files(out_dir):
+    """Return the usable font files as one list per face, best format first.
+
+    Sites commonly serve one face as both woff2 and woff. Files are the same face
+    when their metadata, code points and advance widths match. Drawn outlines are
+    not compared: woff2 can store different glyph bounds than woff, which shifts
+    them. An unreadable file stays on its own, for the specimen and stylesheet
+    writers to report.
+    """
+    faces = {}
+    format_rank = list(FORMATS)
+    for path in sorted(p for p in out_dir.iterdir() if p.suffix.lower() in FORMATS):
+        try:
+            font = TTFont(str(path), fontNumber=0, lazy=True)
+            advances = font["hmtx"]
+            widths = tuple(
+                (codepoint, advances[name][0])
+                for codepoint, name in sorted(font.getBestCmap().items())
+            )
+            face = (_face_metadata(path), widths)
+        except Exception:
+            face = path
+        faces.setdefault(face, []).append(path)
+    return [
+        sorted(paths, key=lambda p: format_rank.index(p.suffix.lower()))
+        for paths in faces.values()
+    ]
 
 
 def download_all(mapping, ranges, out_dir):
@@ -870,8 +939,9 @@ def main():
     if renamed:
         print(f"→ Renamed {renamed} file(s) to match font metadata")
 
-    write_specimen(out_dir, host)
-    write_stylesheet(out_dir, host, hash_ranges)
+    faces = group_face_files(out_dir)
+    write_specimen(out_dir, host, faces)
+    write_stylesheet(out_dir, host, faces, hash_ranges)
     print(f"Done → {out_dir}/")
     return 0
 
